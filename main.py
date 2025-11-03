@@ -4,6 +4,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from urllib.parse import urlparse, parse_qs
 from mwrogue.esports_client import EsportsClient
 from mwrogue.auth_credentials import AuthCredentials
+import os
 
 app = FastAPI()
 ytt_api = YouTubeTranscriptApi()
@@ -16,7 +17,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-credentials = AuthCredentials(user_file="momouchi")
+username = os.getenv("LEAGUEPEDIA_USERNAME")
+password = os.getenv("LEAGUEPEDIA_PASSWORD")
+
+if username and password:
+    # Use credentials from environment (Render)
+    credentials = AuthCredentials(name=username, password=password)
+else:
+    # Fallback for local file (development)
+    credentials = AuthCredentials(user_file="momouchi")
+
 site = EsportsClient('lol', credentials=credentials)
 
 @app.get("/captions/")
