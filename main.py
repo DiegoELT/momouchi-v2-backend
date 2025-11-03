@@ -22,7 +22,7 @@ password = os.getenv("LEAGUEPEDIA_PASSWORD")
 
 if username and password:
     # Use credentials from environment (Render)
-    credentials = AuthCredentials(name=username, password=password)
+    credentials = AuthCredentials(username=username, password=password)
 else:
     # Fallback for local file (development)
     credentials = AuthCredentials(user_file="momouchi")
