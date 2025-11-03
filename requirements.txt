@@ -3,3 +3,4 @@ uvicorn[standard]
 pydantic
 requests
 mwrogue      # for Leaguepedia connection
+youtube-transcript-api
