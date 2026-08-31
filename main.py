@@ -64,6 +64,23 @@ def leaguepedia_query(*, retries: int = 1, **kwargs):
             
 site = _create_site()
 
+# Cargo returns some fields with spaces in the key (e.g. "DateTime UTC" for the
+# DateTime_UTC column). Normalise everything to lowercase snake_case so the
+# frontend can rely on stable key names.
+_KEY_ALIASES = {
+    "datetime utc": "datetime_utc",
+    "gamelength number": "gamelength_number",
+}
+
+
+def normalize_keys(row: dict) -> dict:
+    normalized = {}
+    for key, value in row.items():
+        lowered = key.lower()
+        normalized[_KEY_ALIASES.get(lowered, lowered.replace(" ", "_"))] = value
+    return normalized
+
+
 def extract_youtube_id(video_url: str) -> str | None:
     try:
         # supports regular youtube URL and youtu.be
@@ -118,21 +135,29 @@ def match_details(video_url: str = Query(...)):
     if not video_id:
         return {"error": "Could not extract YouTube video id from URL."}
     
-    try:
-        game_result = leaguepedia_query(
-            tables='ScoreboardGames',
-            fields='OverviewPage, Tournament, Team1, Team2, GameId, Team1Score, Team2Score',
-            where='VOD LIKE "%{}%"'.format(video_id),
-            limit=1,
-            retries=1
-        )
-    except Exception as e:
-        return {"error": f"Leaguepedia query failed after reconnect: {str(e)}"}
+    # Patch / DateTime_UTC / Gamelength were added later. If Cargo ever rejects
+    # them, fall back to the original field set rather than failing the request —
+    # the patch can still be filled in by hand in the UI.
+    BASE_FIELDS = 'OverviewPage, Tournament, Team1, Team2, GameId, Team1Score, Team2Score'
+    EXTENDED_FIELDS = BASE_FIELDS + ', Patch, DateTime_UTC, Gamelength'
 
-    # Change the key names to lowercase
-    matches = []
-    for match in game_result:
-        matches.append({k.lower(): v for k, v in match.items()})
+    game_result = None
+    for fields in (EXTENDED_FIELDS, BASE_FIELDS):
+        try:
+            game_result = leaguepedia_query(
+                tables='ScoreboardGames',
+                fields=fields,
+                where='VOD LIKE "%{}%"'.format(video_id),
+                limit=1,
+                retries=1
+            )
+            break
+        except Exception as e:
+            if fields == BASE_FIELDS:
+                return {"error": f"Leaguepedia query failed after reconnect: {str(e)}"}
+
+    # Change the key names to lowercase (and normalise Cargo's spaced keys)
+    matches = [normalize_keys(match) for match in game_result]
 
     # Now get the players for the game.
     game = matches[0] if matches else None
@@ -151,7 +176,7 @@ def match_details(video_url: str = Query(...)):
         team1 = {'team_name': game['team1'], 'players': []}
         team2 = {'team_name': game['team2'], 'players': []}
         for player in players:
-            player_data = {k.lower(): v for k, v in player.items()}
+            player_data = normalize_keys(player)
             if player_data['team'] == game['team1']:
                 team1['players'].append(player_data)
             elif player_data['team'] == game['team2']:
