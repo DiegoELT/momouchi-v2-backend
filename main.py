@@ -1,187 +1,293 @@
+"""
+Momouchi-v2 annotation backend (serving layer).
+
+By default this process makes NO outbound calls to YouTube or Leaguepedia. It
+serves captions and match metadata from the corpus snapshot in data/corpus,
+which is produced locally by ingest.py.
+
+That is deliberate: YouTube blocks datacenter IPs, so any cloud-hosted service
+that fetches captions at request time will break. Serving a snapshot also keeps
+the annotation unit stable across the annotation period.
+
+Set ALLOW_LIVE_FETCH=1 for local development if you want the old behaviour of
+falling back to the live APIs when a game has not been ingested yet.
+"""
+
+import os
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from youtube_transcript_api import YouTubeTranscriptApi
-from urllib.parse import urlparse, parse_qs
-from mwrogue.esports_client import EsportsClient
-from mwrogue.auth_credentials import AuthCredentials
-import os
-import threading
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
-app = FastAPI()
-ytt_api = YouTubeTranscriptApi()
+import corpus
+from sources import SourceUnavailable, extract_youtube_id
+
+
+def _flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes")
+
+
+ALLOW_LIVE_FETCH = _flag("ALLOW_LIVE_FETCH", "0")
+
+# Ingestion WRITES to the corpus and fetches from YouTube, so it only works on a
+# machine with a residential IP and a persistent disk — i.e. your laptop.
+# Defaults to whatever ALLOW_LIVE_FETCH is, so the local dev flag turns on the
+# whole local workflow. MUST stay off on the hosted deployment.
+ALLOW_INGEST = _flag("ALLOW_INGEST", "1" if ALLOW_LIVE_FETCH else "0")
+
+
+class IngestRequest(BaseModel):
+    video_url: str
+    start: float | None = None
+    end: float | None = None
+    refresh: bool = False
+
+
+class TrimRequest(BaseModel):
+    start: float | None = None
+    end: float | None = None
+
+# Comma-separated list; defaults to open for backwards compatibility.
+ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+]
+
+app = FastAPI(title="Momouchi-v2 backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # loosen later for security
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-username = os.getenv("LEAGUEPEDIA_USERNAME")
-password = os.getenv("LEAGUEPEDIA_PASSWORD")
 
-if username and password:
-    # Use credentials from environment (Render)
-    credentials = AuthCredentials(username=username, password=password)
-else:
-    # Fallback for local file (development)
-    credentials = AuthCredentials(user_file="momouchi")
-
-_site_lock = threading.Lock()
-site = None
-
-def _create_site():
-    return EsportsClient('lol', credentials=credentials)
-
-def _reset_site():
-    global site
-    with _site_lock:
-        site = _create_site()
-    return site
-
-def _get_site():
-    global site
-    if site is None:
-        site = _create_site()
-    return site
-
-def leaguepedia_query(*, retries: int = 1, **kwargs):
-    """
-    Cargo query with automatic reconnect on failure.
-    """
-    last_error = None 
-    for attempt in range(retries + 1):
-        try:
-            client = _get_site()
-            return client.cargo_client.query(**kwargs)
-        except Exception as e:
-            last_error = e
-            # rebuild connection and retry
-            _reset_site()
-            if attempt == retries:
-                raise last_error
-            
-site = _create_site()
-
-# Cargo returns some fields with spaces in the key (e.g. "DateTime UTC" for the
-# DateTime_UTC column). Normalise everything to lowercase snake_case so the
-# frontend can rely on stable key names.
-_KEY_ALIASES = {
-    "datetime utc": "datetime_utc",
-    "gamelength number": "gamelength_number",
-}
+def _error(message: str, status: int = 404, **extra):
+    return JSONResponse({"error": message, **extra}, status_code=status)
 
 
-def normalize_keys(row: dict) -> dict:
-    normalized = {}
-    for key, value in row.items():
-        lowered = key.lower()
-        normalized[_KEY_ALIASES.get(lowered, lowered.replace(" ", "_"))] = value
-    return normalized
+def _not_ingested(video_id: str):
+    return _error(
+        f"Game {video_id} is not in the corpus. Run "
+        f"`python ingest.py <video_url>` locally, commit data/corpus, and "
+        f"redeploy.",
+        status=404,
+        video_id=video_id,
+        ingested=False,
+    )
 
 
-def extract_youtube_id(video_url: str) -> str | None:
-    try:
-        # supports regular youtube URL and youtu.be
-        parsed = urlparse(video_url)
-        if parsed.hostname and "youtu" in parsed.hostname:
-            if parsed.hostname == "youtu.be":
-                return parsed.path.strip("/")
-            qs = parse_qs(parsed.query)
-            return qs.get("v", [None])[0]
-    except Exception:
-        return None
-    return None
+@app.get("/health")
+def health():
+    """Cheap liveness probe that touches nothing external."""
+    return {
+        "status": "ok",
+        "games_in_corpus": len(corpus.entries()),
+        "live_fetch_enabled": ALLOW_LIVE_FETCH,
+        "ingest_enabled": ALLOW_INGEST,
+    }
+
+
+@app.get("/corpus/")
+def list_corpus():
+    """Games available to annotate, for the frontend picker."""
+    return {"games": corpus.entries()}
+
 
 @app.get("/captions/")
 def get_captions(video_url: str = Query(...)):
-    """
-    Extracts YouTube video ID and fetches captions if available.
-    """
-    try:
-        parsed = urlparse(video_url)
-        video_id = parse_qs(parsed.query).get("v", [None])[0]
-        if not video_id:
-            return {"error": "Invalid YouTube URL."}
-        transcript = ytt_api.fetch(video_id)
-
-        return {"video_id": video_id, "captions": transcript.to_raw_data()}
-    except Exception as e:
-        return {"error": str(e)}
-    
-@app.get("/leaguepedia/latest_games/")
-def latest_games():
-    try:
-        results = leaguepedia_query(
-            tables='Tournaments, ScoreboardGames',
-            join_on='Tournaments.OverviewPage = ScoreboardGames.OverviewPage',
-            fields='Tournaments.OverviewPage, Name, Team1, Team2, VOD, IsOfficial',
-            where="VOD IS NOT NULL AND Tournaments.OverviewPage != '2025 Season World Championship/Main Event' AND IsOfficial='1' AND VOD NOT LIKE \"%live%\"",
-            order_by='DateTime_UTC DESC',
-            limit=10,
-            retries=1
-        )
-        return {"results": list(results)}
-    except Exception as e:
-        return {"error": f"Leaguepedia query failed after reconnect: {str(e)}"}
-    
-@app.get("/match_details/")
-def match_details(video_url: str = Query(...)):
-    """
-    Fetches match details from Leaguepedia based on the provided VOD URL.
-    """
     video_id = extract_youtube_id(video_url)
     if not video_id:
-        return {"error": "Could not extract YouTube video id from URL."}
-    
-    # Patch / DateTime_UTC / Gamelength were added later. If Cargo ever rejects
-    # them, fall back to the original field set rather than failing the request —
-    # the patch can still be filled in by hand in the UI.
-    BASE_FIELDS = 'OverviewPage, Tournament, Team1, Team2, GameId, Team1Score, Team2Score'
-    EXTENDED_FIELDS = BASE_FIELDS + ', Patch, DateTime_UTC, Gamelength'
+        return _error("Invalid YouTube URL.", status=400)
 
-    game_result = None
-    for fields in (EXTENDED_FIELDS, BASE_FIELDS):
-        try:
-            game_result = leaguepedia_query(
-                tables='ScoreboardGames',
-                fields=fields,
-                where='VOD LIKE "%{}%"'.format(video_id),
-                limit=1,
-                retries=1
-            )
-            break
-        except Exception as e:
-            if fields == BASE_FIELDS:
-                return {"error": f"Leaguepedia query failed after reconnect: {str(e)}"}
+    entry = corpus.load(video_id)
+    if entry:
+        captions = entry.get("captions", [])
+        trim = entry.get("trim")
+        return {
+            "video_id": video_id,
+            "captions": corpus.apply_trim(captions, trim),
+            "trim": trim,
+            "caption_count": len(captions),
+            "source": "corpus",
+            "fetched_at": entry.get("fetched_at"),
+        }
 
-    # Change the key names to lowercase (and normalise Cargo's spaced keys)
-    matches = [normalize_keys(match) for match in game_result]
+    if not ALLOW_LIVE_FETCH:
+        return _not_ingested(video_id)
 
-    # Now get the players for the game.
-    game = matches[0] if matches else None
-    if game:
-        try:
-            players = leaguepedia_query(
-                tables='ScoreboardPlayers',
-                fields='Name, Champion, Kills, Deaths, Assists, Team, Role',
-                where='GameId="{}"'.format(game['gameid']),
-                retries=1
-            )
-        except Exception as e:
-            return {"error": f"Leaguepedia player query failed after reconnect: {str(e)}"}
-        
-        # Make Team1 and Team2 objects, with the name of the team from before, and the players
-        team1 = {'team_name': game['team1'], 'players': []}
-        team2 = {'team_name': game['team2'], 'players': []}
-        for player in players:
-            player_data = normalize_keys(player)
-            if player_data['team'] == game['team1']:
-                team1['players'].append(player_data)
-            elif player_data['team'] == game['team2']:
-                team2['players'].append(player_data)
-        game['team1'] = team1
-        game['team2'] = team2
+    try:
+        from sources import fetch_captions
 
-    return {"matches": game}
+        # Preview only — nothing is written until "Add to corpus".
+        return {
+            "video_id": video_id,
+            "captions": fetch_captions(video_id),
+            "trim": None,
+            "source": "live",
+        }
+    except SourceUnavailable as e:
+        return _error(str(e), status=503)
+    except Exception as e:
+        return _error(f"Caption fetch failed: {e}", status=502)
+
+
+@app.get("/match_details/")
+def match_details(video_url: str = Query(...)):
+    video_id = extract_youtube_id(video_url)
+    if not video_id:
+        return _error("Could not extract YouTube video id from URL.", status=400)
+
+    entry = corpus.load(video_id)
+    if entry:
+        return {"matches": entry.get("match"), "source": "corpus"}
+
+    if not ALLOW_LIVE_FETCH:
+        return _not_ingested(video_id)
+
+    try:
+        from sources import fetch_match_details
+
+        return {"matches": fetch_match_details(video_id), "source": "live"}
+    except SourceUnavailable as e:
+        return _error(str(e), status=503)
+    except Exception as e:
+        return _error(f"Match lookup failed: {e}", status=502)
+
+
+def _ingest_disabled():
+    return _error(
+        "Ingestion is disabled on this deployment. Corpus snapshots are built "
+        "locally (ALLOW_INGEST=1) and committed to git.",
+        status=403,
+    )
+
+
+@app.post("/corpus/")
+def add_to_corpus(req: IngestRequest):
+    """
+    Fetch a VOD's captions and metadata and write a corpus snapshot.
+
+    Local-only: YouTube blocks datacenter IPs, and a hosted filesystem is
+    ephemeral anyway. Captions are stored in FULL; the trim is recorded
+    alongside them so it can be redone later without re-fetching.
+    """
+    if not ALLOW_INGEST:
+        return _ingest_disabled()
+
+    video_id = extract_youtube_id(req.video_url)
+    if not video_id:
+        return _error("Invalid YouTube URL.", status=400)
+
+    try:
+        trim = corpus.normalize_trim(req.start, req.end)
+    except ValueError as e:
+        return _error(str(e), status=400)
+
+    if corpus.exists(video_id) and not req.refresh:
+        return _error(
+            f"{video_id} is already in the corpus. Adjust its bounds with "
+            f"/corpus/{video_id}/trim instead of re-fetching — re-fetching can "
+            f"return different captions and would break existing annotations.",
+            status=409,
+            video_id=video_id,
+        )
+
+    try:
+        from sources import fetch_captions, fetch_match_details
+
+        captions = fetch_captions(video_id)
+    except SourceUnavailable as e:
+        return _error(str(e), status=503)
+    except Exception as e:
+        return _error(f"Caption fetch failed: {e}", status=502)
+
+    if not captions:
+        return _error("YouTube returned no captions for this VOD.", status=502)
+
+    # Missing match metadata must not block ingestion — patch and teams can be
+    # filled in by hand in the UI.
+    match = None
+    match_error = None
+    try:
+        match = fetch_match_details(video_id)
+        if match is None:
+            match_error = "No Leaguepedia game matched this VOD."
+    except Exception as e:
+        match_error = f"Leaguepedia lookup failed: {e}"
+
+    corpus.save(video_id, req.video_url, captions, match, trim)
+    entry = corpus.load(video_id)
+
+    return {
+        "video_id": video_id,
+        "saved": True,
+        "trim": trim,
+        "caption_count": entry["caption_count"],
+        "trimmed_count": entry["trimmed_count"],
+        "match_warning": match_error,
+    }
+
+
+@app.post("/corpus/{video_id}/trim")
+def retrim(video_id: str, req: TrimRequest):
+    """
+    Recompute the trim from the stored full captions. Never touches YouTube, so
+    the caption text is guaranteed identical to what was ingested.
+    """
+    if not ALLOW_INGEST:
+        return _ingest_disabled()
+
+    try:
+        trim = corpus.normalize_trim(req.start, req.end)
+    except ValueError as e:
+        return _error(str(e), status=400)
+
+    if not corpus.exists(video_id):
+        return _error(f"{video_id} is not in the corpus.", status=404)
+
+    entry = corpus.set_trim(video_id, trim)
+    return {
+        "video_id": video_id,
+        "trim": trim,
+        "caption_count": entry["caption_count"],
+        "trimmed_count": entry["trimmed_count"],
+    }
+
+
+@app.get("/leaguepedia/latest_games/")
+def latest_games():
+    """
+    Discovery helper for finding VODs to ingest. Live-only by nature, so it is
+    disabled on the hosted deployment.
+    """
+    if not ALLOW_LIVE_FETCH:
+        return _error(
+            "Live Leaguepedia search is disabled on this deployment. Run the "
+            "backend locally with ALLOW_LIVE_FETCH=1 to search for VODs.",
+            status=503,
+        )
+
+    try:
+        from sources import leaguepedia_query
+
+        results = leaguepedia_query(
+            tables="Tournaments, ScoreboardGames",
+            join_on="Tournaments.OverviewPage = ScoreboardGames.OverviewPage",
+            fields="Tournaments.OverviewPage, Name, Team1, Team2, VOD, IsOfficial",
+            where=(
+                "VOD IS NOT NULL AND Tournaments.OverviewPage != "
+                "'2025 Season World Championship/Main Event' AND "
+                "IsOfficial='1' AND VOD NOT LIKE \"%live%\""
+            ),
+            order_by="DateTime_UTC DESC",
+            limit=10,
+            retries=1,
+        )
+        return {"results": list(results)}
+    except SourceUnavailable as e:
+        return _error(str(e), status=503)
+    except Exception as e:
+        return _error(f"Leaguepedia query failed: {e}", status=502)

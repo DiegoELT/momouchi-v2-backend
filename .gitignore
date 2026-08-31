@@ -10,3 +10,6 @@ venv/
 # macOS / Linux junk
 .DS_Store
 Thumbs.db
+
+# Half-written corpus snapshots
+*.json.tmp

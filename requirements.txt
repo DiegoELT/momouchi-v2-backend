@@ -2,5 +2,9 @@ fastapi
 uvicorn[standard]
 pydantic
 requests
-mwrogue      # for Leaguepedia connection
-youtube-transcript-api
+
+# Ingestion-only dependencies. The hosted serving layer never imports these
+# unless ALLOW_LIVE_FETCH=1, so they can be dropped from a deployment build.
+mwrogue                 # Leaguepedia (Cargo) client
+youtube-transcript-api  # blocked from datacenter IPs — run ingest.py locally
+python-dotenv           # loads backend/.env for ingest.py
