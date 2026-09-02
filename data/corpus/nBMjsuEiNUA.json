@@ -4,11 +4,11 @@
   "video_url": "https://www.youtube.com/watch?v=nBMjsuEiNUA&t=4901s",
   "fetched_at": "2026-09-02T12:50:57+00:00",
   "trim": {
-    "start": 5170.0,
-    "end": 6793.0
+    "start": 1906.0,
+    "end": 3787.0
   },
   "caption_count": 2364,
-  "trimmed_count": 672,
+  "trimmed_count": 798,
   "captions": [
     {
       "text": "he",
@@ -11941,5 +11941,6 @@
     "datetime_utc": "2024-07-01 00:14:00",
     "gamelength": "31:29",
     "datetime_utc__precision": "0"
-  }
+  },
+  "retrimmed_at": "2026-09-02T15:12:41+00:00"
 }
