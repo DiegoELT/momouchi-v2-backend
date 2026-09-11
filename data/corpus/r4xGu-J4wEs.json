@@ -4,11 +4,11 @@
   "video_url": "https://www.youtube.com/watch?v=r4xGu-J4wEs&t=144s",
   "fetched_at": "2026-09-02T13:57:25+00:00",
   "trim": {
-    "start": 633.0,
+    "start": 679.0,
     "end": 2348.0
   },
   "caption_count": 1233,
-  "trimmed_count": 851,
+  "trimmed_count": 826,
   "captions": [
     {
       "text": "welcome back ladies and gentlemen and to",
@@ -6286,5 +6286,6 @@
     "datetime_utc": "2020-03-22 18:42:00",
     "gamelength": "28:08",
     "datetime_utc__precision": "0"
-  }
+  },
+  "retrimmed_at": "2026-09-09T15:57:17+00:00"
 }
