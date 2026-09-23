@@ -196,6 +196,58 @@ BASE_FIELDS = (
 EXTENDED_FIELDS = BASE_FIELDS + ", Patch, DateTime_UTC, Gamelength"
 
 
+def fetch_match_candidates(video_id: str) -> list[dict]:
+    """
+    Every ScoreboardGames row whose VOD contains this video id.
+
+    A best-of-N broadcast carries the SAME VOD URL on every game row, so this
+    routinely returns more than one. Callers must disambiguate rather than take
+    the first — taking the first is how a game ends up with another game's
+    patch, scoreboard and length.
+    """
+    rows = None
+    for fields in (EXTENDED_FIELDS + ", N_GameInMatch", EXTENDED_FIELDS, BASE_FIELDS):
+        try:
+            rows = leaguepedia_query(
+                tables="ScoreboardGames",
+                fields=fields,
+                where='VOD LIKE "%{}%"'.format(video_id),
+                order_by="N_GameInMatch ASC",
+                limit=20,
+                retries=1,
+            )
+            break
+        except Exception:
+            if fields == BASE_FIELDS:
+                raise
+
+    return [normalize_keys(row) for row in (rows or [])]
+
+
+def attach_players(game: dict) -> dict:
+    """Add the per-team player lists to one ScoreboardGames row."""
+    players = leaguepedia_query(
+        tables="ScoreboardPlayers",
+        fields="Name, Champion, Kills, Deaths, Assists, Team, Role",
+        where='GameId="{}"'.format(game["gameid"]),
+        retries=1,
+    )
+
+    team1 = {"team_name": game["team1"], "players": []}
+    team2 = {"team_name": game["team2"], "players": []}
+    for player in players:
+        pd = normalize_keys(player)
+        if pd["team"] == game["team1"]:
+            team1["players"].append(pd)
+        elif pd["team"] == game["team2"]:
+            team2["players"].append(pd)
+
+    game = dict(game)
+    game["team1"] = team1
+    game["team2"] = team2
+    return game
+
+
 def fetch_match_details(video_id: str) -> dict | None:
     """
     Fetch match metadata for a VOD. Returns None when Leaguepedia has no game
