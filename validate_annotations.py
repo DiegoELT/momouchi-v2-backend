@@ -33,6 +33,12 @@ LABELS = {
 
 FLAGS = {"UNCERTAIN", "ASR-ERROR", "NON-CONTENT", "MULTI-FUNCTION"}
 
+# A segment with no annotatable content has no discourse function to record, so
+# NON-CONTENT is the one flag that may stand alone. Everything else unlabelled
+# is a gap. Technical pauses mid-game are the main source: the broadcast is up
+# but the game is not being played.
+STANDALONE_FLAG = "NON-CONTENT"
+
 # Required Leaguepedia metadata.
 REQUIRED_MATCH_FIELDS = ("patch", "datetime_utc", "gamelength")
 
@@ -192,6 +198,7 @@ def validate(path):
 
     # --- per-caption checks ------------------------------------------------
     missing_label, bad_label = [], []
+    non_content = 0
     bad_flag, multi_flag = [], []
     missing_version = []
     outside_trim = []
@@ -208,8 +215,12 @@ def validate(path):
 
         # label in the six-set
         label = cap.get("label")
+        flag_value = cap.get("flag")
         if label in (None, "", "None"):
-            missing_label.append(describe(cap, i))
+            if flag_value != STANDALONE_FLAG:
+                missing_label.append(describe(cap, i))
+            else:
+                non_content += 1
         elif label not in LABELS:
             bad_label.append(f"{describe(cap, i)} → {label!r}")
 
@@ -254,8 +265,14 @@ def validate(path):
                 ):
                     outside_trim.append(describe(cap, i))
 
+    if non_content:
+        rep.info["non_content"] = non_content
     if missing_label:
-        rep.error("label-missing", f"{len(missing_label)} caption(s) have no label", missing_label)
+        rep.error(
+            "label-missing",
+            f"{len(missing_label)} caption(s) have no label and no NON-CONTENT flag",
+            missing_label,
+        )
     if bad_label:
         rep.error("label-invalid", f"{len(bad_label)} caption(s) have a label outside the six-set", bad_label)
     if bad_flag:
@@ -364,6 +381,9 @@ def main(argv=None):
             if i.get("patch"):
                 bits.append(f"patch {i['patch']}")
             print(f"    {' | '.join(bits)}")
+            if i.get("non_content"):
+                bits2 = f"{i['non_content']} NON-CONTENT (unlabelled by design)"
+                print(f"    {bits2}")
             if i.get("caption_versions"):
                 spread = ", ".join(
                     f"v{v}: {n}" for v, n in sorted(i["caption_versions"].items())
